@@ -1,142 +1,60 @@
-import { Agent as HttpAgent, request as httpRequest } from "node:http";
-import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createReadStream } from "node:fs";
 import { appendFile, mkdir, stat } from "node:fs/promises";
 import { dirname, extname, resolve } from "node:path";
-import { buildNapCatMediaCq } from "./media.js";
 import { getNapCatRuntime, getNapCatConfig } from "./runtime.js";
 
 // Group name cache removed
 
 
-function sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-const napcatHttpAgent = new HttpAgent({
-    keepAlive: true,
-    keepAliveMsecs: 10000,
-    maxSockets: 20,
-    maxFreeSockets: 10,
-});
-
-const napcatHttpsAgent = new HttpsAgent({
-    keepAlive: true,
-    keepAliveMsecs: 10000,
-    maxSockets: 20,
-    maxFreeSockets: 10,
-});
-
-function isRetryableNapCatError(err: any): boolean {
-    const code = String(err?.cause?.code || err?.code || "");
-    return ["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "UND_ERR_SOCKET", "ECONNABORTED"].includes(code);
-}
-
-async function postJsonWithNodeHttp(
-    url: string,
-    payload: any,
-    timeoutMs: number,
-    opts?: { connectionClose?: boolean; token?: string }
-): Promise<{ statusCode: number; statusText: string; bodyText: string }> {
-    const target = new URL(url);
-    const isHttps = target.protocol === "https:";
-    const body = JSON.stringify(payload);
-    const transport = isHttps ? httpsRequest : httpRequest;
-    const connectionClose = opts?.connectionClose === true;
-    const normalizedToken = String(opts?.token ?? "").trim();
-    const agent = connectionClose ? undefined : (isHttps ? napcatHttpsAgent : napcatHttpAgent);
-
-    return new Promise((resolve, reject) => {
-        const headers: Record<string, string | number> = {
-            "Content-Type": "application/json",
-            "Content-Length": Buffer.byteLength(body),
-            "Connection": connectionClose ? "close" : "keep-alive",
-        };
-        if (normalizedToken) {
-            headers["Authorization"] = `Bearer ${normalizedToken}`;
-        }
-        const req = transport(
-            {
-                protocol: target.protocol,
-                hostname: target.hostname,
-                port: target.port || (isHttps ? 443 : 80),
-                path: `${target.pathname}${target.search}`,
-                method: "POST",
-                agent,
-                headers,
-            },
-            (res) => {
-                const chunks: Buffer[] = [];
-                res.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
-                res.on("end", () => {
-                    const bodyText = Buffer.concat(chunks).toString("utf8");
-                    resolve({
-                        statusCode: res.statusCode || 0,
-                        statusText: res.statusMessage || "",
-                        bodyText,
-                    });
-                });
-            }
-        );
-
-        req.setTimeout(timeoutMs, () => {
-            req.destroy(Object.assign(new Error(`NapCat request timeout after ${timeoutMs}ms`), { code: "ETIMEDOUT" }));
-        });
-
-        req.on("error", reject);
-        req.write(body);
-        req.end();
+// Simple function to send message via NapCat API
+async function sendToNapCat(url: string, payload: any) {
+    const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
     });
-}
-
-// Send message via NapCat API (node http/https keep-alive + retry for transient socket errors)
-async function sendToNapCat(url: string, payload: any, token?: string) {
-    const maxAttempts = 3;
-    const timeoutsMs = [5000, 7000, 9000];
-    const cfg = getNapCatConfig();
-    const connectionClose = cfg.connectionClose !== false; // default true for local docker stability
-    const target = new URL(url);
-    const targetInfo = `${target.protocol}//${target.hostname}:${target.port || (target.protocol === "https:" ? "443" : "80")}${target.pathname}`;
-
-    let lastErr: any = null;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        const startedAt = Date.now();
-        try {
-            const timeoutMs = timeoutsMs[Math.min(attempt - 1, timeoutsMs.length - 1)];
-            const res = await postJsonWithNodeHttp(url, payload, timeoutMs, { connectionClose, token });
-
-            if (res.statusCode < 200 || res.statusCode >= 300) {
-                throw new Error(`NapCat API Error: ${res.statusCode} ${res.statusText}${res.bodyText ? ` | ${res.bodyText.slice(0, 300)}` : ""}`);
-            }
-
-            const elapsedMs = Date.now() - startedAt;
-            console.log(`[NapCat] sendToNapCat success attempt ${attempt}/${maxAttempts} ${targetInfo} in ${elapsedMs}ms (connection=${connectionClose ? "close" : "keep-alive"})`);
-
-            if (!res.bodyText) return { status: "ok" };
-            try {
-                return JSON.parse(res.bodyText);
-            } catch {
-                return { status: "ok", raw: res.bodyText };
-            }
-        } catch (err: any) {
-            lastErr = err;
-            const retryable = isRetryableNapCatError(err);
-            const elapsedMs = Date.now() - startedAt;
-            if (!retryable || attempt >= maxAttempts) {
-                console.error(`[NapCat] sendToNapCat failed attempt ${attempt}/${maxAttempts} ${targetInfo} in ${elapsedMs}ms: ${err?.cause?.code || err?.code || err}`);
-                break;
-            }
-            const backoffMs = attempt * 400;
-            console.warn(`[NapCat] sendToNapCat retry ${attempt}/${maxAttempts} ${targetInfo} in ${elapsedMs}ms; backoff ${backoffMs}ms; reason=${err?.cause?.code || err?.code || err}`);
-            await sleep(backoffMs);
-        }
+    if (!res.ok) {
+        throw new Error(`NapCat API Error: ${res.status} ${res.statusText}`);
     }
-
-    throw lastErr;
+    return await res.json();
 }
 
-async function buildNapCatMessageFromReply(
+function buildMediaProxyUrl(mediaUrl: string, config: any): string {
+    const enabled = config.mediaProxyEnabled === true;
+    const baseUrl = String(config.publicBaseUrl || "").trim().replace(/\/+$/, "");
+    if (!enabled || !baseUrl) return mediaUrl;
+
+    const token = String(config.mediaProxyToken || "").trim();
+    const query = new URLSearchParams({ url: mediaUrl });
+    if (token) query.set("token", token);
+    return `${baseUrl}/napcat/media?${query.toString()}`;
+}
+
+function isAudioMedia(mediaUrl: string): boolean {
+    return /\.(wav|mp3|amr|silk|ogg|m4a|flac|aac)(?:\?.*)?$/i.test(mediaUrl);
+}
+
+function resolveVoiceMediaUrl(mediaUrl: string, config: any): string {
+    const trimmed = mediaUrl.trim();
+    if (!trimmed) return trimmed;
+    if (/^(https?:\/\/|file:\/\/)/i.test(trimmed) || trimmed.startsWith("/")) {
+        return trimmed;
+    }
+    const voiceBasePath = String(config.voiceBasePath || "").trim().replace(/\/+$/, "");
+    if (!voiceBasePath) return trimmed;
+    return `${voiceBasePath}/${trimmed.replace(/^\/+/, "")}`;
+}
+
+function buildNapCatMediaCq(mediaUrl: string, config: any, forceVoice = false): string {
+    const shouldUseVoice = forceVoice || isAudioMedia(mediaUrl);
+    const resolvedUrl = shouldUseVoice ? resolveVoiceMediaUrl(mediaUrl, config) : mediaUrl;
+    const proxiedMediaUrl = buildMediaProxyUrl(resolvedUrl, config);
+    const type = shouldUseVoice ? "record" : "image";
+    return `[CQ:${type},file=${proxiedMediaUrl}]`;
+}
+
+function buildNapCatMessageFromReply(
     payload: { text?: string; mediaUrl?: string; mediaUrls?: string[]; audioAsVoice?: boolean },
     config: any
 ) {
@@ -145,12 +63,10 @@ async function buildNapCatMessageFromReply(
         ...(payload.mediaUrls || []),
         ...(payload.mediaUrl ? [payload.mediaUrl] : [])
     ];
-    const mediaSegments = await Promise.all(
-        mediaCandidates
-            .map((url) => String(url || "").trim())
-            .filter(Boolean)
-            .map((url) => buildNapCatMediaCq(url, config, payload.audioAsVoice === true))
-    );
+    const mediaSegments = mediaCandidates
+        .map((url) => String(url || "").trim())
+        .filter(Boolean)
+        .map((url) => buildNapCatMediaCq(url, config, payload.audioAsVoice === true));
 
     if (text && mediaSegments.length > 0) return `${text}\n${mediaSegments.join("\n")}`;
     if (text) return text;
@@ -361,11 +277,6 @@ export async function handleNapCatWebhook(req: IncomingMessage, res: ServerRespo
     try {
         const body = await readBody(req);
         const config = getNapCatConfig();
-
-        // Note: Token verification for incoming requests from NapCat is not implemented
-        // because NapCat's HTTP client does not support custom Authorization headers.
-        // The token is only used when OpenClaw sends messages TO NapCat.
-
         const events = extractNapCatEvents(body);
 
         try {
@@ -419,6 +330,9 @@ export async function handleNapCatWebhook(req: IncomingMessage, res: ServerRespo
             // Group message handling
             const enableGroupMessages = config.enableGroupMessages || false;
             const groupMentionOnly = config.groupMentionOnly !== false; // Default true
+            const groupKeywords = config.groupKeywords || []; // New: keyword trigger mode
+            console.log(`[NapCat] DEBUG: groupKeywords=${JSON.stringify(groupKeywords)}, groupMentionOnly=${groupMentionOnly}`);
+            let hasKeyword = false;
             let wasMentioned = !isGroup; // In DMs, we consider it "mentioned"
 
             if (isGroup) {
@@ -432,7 +346,39 @@ export async function handleNapCatWebhook(req: IncomingMessage, res: ServerRespo
                 }
 
                 const botId = event.self_id || config.selfId;
-                if (groupMentionOnly) {
+
+                // Check for keywords (keyword trigger mode) - use rawText to include @mentions
+                if (groupKeywords.length > 0) {
+                    const lowerRawText = rawText.toLowerCase();
+                    hasKeyword = groupKeywords.some((kw: string) => {
+                        const keyword = String(kw).toLowerCase().trim();
+                        return keyword && lowerRawText.includes(keyword);
+                    });
+                }
+
+                // Check if bot was mentioned
+                let isMentioned = false;
+                if (botId) {
+                    const mentionPatternCQ = new RegExp(`\\[CQ:at,qq=${botId}\\]`, 'i');
+                    const allMentionPatternCQ = /\[CQ:at,qq=all\]/i;
+                    const mentionPatternPlain1 = new RegExp(`@[^\\s]+ \\(${botId}\\)`, 'i');
+                    const mentionPatternPlain2 = new RegExp(`@${botId}(?:\\s|$|,)`, 'i');
+                    isMentioned = mentionPatternCQ.test(text) || allMentionPatternCQ.test(text) || 
+                                  mentionPatternPlain1.test(text) || mentionPatternPlain2.test(text);
+                }
+
+                if (groupKeywords.length > 0) {
+                    // Keyword trigger mode: process if mentioned OR contains keyword
+                    if (!isMentioned && !hasKeyword) {
+                        console.log(`[NapCat] Ignoring group message (need keyword or mention)`);
+                        res.statusCode = 200;
+                        res.setHeader("Content-Type", "application/json");
+                        res.end('{"status":"ok"}');
+                        return true;
+                    }
+                    wasMentioned = isMentioned;
+                    console.log(`[NapCat] Keyword trigger: mentioned=${isMentioned}, hasKeyword=${hasKeyword}, processing message`);
+                } else if (groupMentionOnly) {
                     // Check if bot was mentioned
                     // NapCat sends self_id as the bot's QQ number
                     if (!botId) {
@@ -585,11 +531,10 @@ export async function handleNapCatWebhook(req: IncomingMessage, res: ServerRespo
                         // Actually send the message via NapCat API
                         const config = getNapCatConfig();
                         const baseUrl = config.url || "http://127.0.0.1:3000";
-                        const token = String(config.token || "").trim();
                         const isGroup = conversationId.startsWith("group:");
                         const targetId = isGroup ? conversationId.replace("group:", "") : conversationId.replace("private:", "");
                         const endpoint = isGroup ? "/send_group_msg" : "/send_private_msg";
-                        const message = await buildNapCatMessageFromReply(payload, config);
+                        const message = buildNapCatMessageFromReply(payload, config);
                         if (!message) {
                             console.log("[NapCat] Skip empty reply payload");
                             return;
@@ -599,12 +544,8 @@ export async function handleNapCatWebhook(req: IncomingMessage, res: ServerRespo
                         else msgPayload.user_id = targetId;
                         
                         console.log(`[NapCat] Sending reply to ${isGroup ? 'group' : 'private'} ${targetId}: ${message.substring(0, 50)}...`);
-                        try {
-                            await sendToNapCat(`${baseUrl}${endpoint}`, msgPayload, token);
-                            console.log("[NapCat] Reply sent successfully");
-                        } catch (err) {
-                            console.error("[NapCat] Reply delivery failed (suppressed to avoid channel crash):", err);
-                        }
+                        await sendToNapCat(`${baseUrl}${endpoint}`, msgPayload);
+                        console.log("[NapCat] Reply sent successfully");
                     },
                     onError: (err, info) => {
                         console.error(`[NapCat] Reply error (${info.kind}):`, err);
@@ -623,11 +564,10 @@ export async function handleNapCatWebhook(req: IncomingMessage, res: ServerRespo
                         // Actually send the message via NapCat API
                         const config = getNapCatConfig();
                         const baseUrl = config.url || "http://127.0.0.1:3000";
-                        const token = String(config.token || "").trim();
                         const isGroup = conversationId.startsWith("group:");
                         const targetId = isGroup ? conversationId.replace("group:", "") : conversationId.replace("private:", "");
                         const endpoint = isGroup ? "/send_group_msg" : "/send_private_msg";
-                        const message = await buildNapCatMessageFromReply(payload, config);
+                        const message = buildNapCatMessageFromReply(payload, config);
                         if (!message) {
                             console.log("[NapCat] Skip empty reply payload");
                             return;
@@ -637,12 +577,8 @@ export async function handleNapCatWebhook(req: IncomingMessage, res: ServerRespo
                         else msgPayload.user_id = targetId;
                         
                         console.log(`[NapCat] Sending reply to ${isGroup ? 'group' : 'private'} ${targetId}: ${message.substring(0, 50)}...`);
-                        try {
-                            await sendToNapCat(`${baseUrl}${endpoint}`, msgPayload, token);
-                            console.log("[NapCat] Reply sent successfully");
-                        } catch (err) {
-                            console.error("[NapCat] Reply delivery failed (suppressed to avoid channel crash):", err);
-                        }
+                        await sendToNapCat(`${baseUrl}${endpoint}`, msgPayload);
+                        console.log("[NapCat] Reply sent successfully");
                     },
                     onError: (err, info) => {
                         console.error(`[NapCat] Reply error (${info.kind}):`, err);

@@ -1,83 +1,49 @@
 // Minimal NapCat Channel Implementation
-import path from "node:path";
-import { access, copyFile, mkdir, unlink } from "node:fs/promises";
-import { buildNapCatMediaCq, isAudioMedia, resolveLocalFilePath } from "./media.js";
 import { setNapCatConfig } from "./runtime.js";
 
-async function sendToNapCat(url: string, payload: any, token?: string) {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    const normalizedToken = String(token ?? "").trim();
-    if (normalizedToken) {
-        headers["Authorization"] = `Bearer ${normalizedToken}`;
-    }
+async function sendToNapCat(url: string, payload: any) {
     const res = await fetch(url, {
         method: "POST",
-        headers,
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
     });
     if (!res.ok) {
-        let body = "";
-        try {
-            body = await res.text();
-        } catch {
-            body = "";
-        }
-        throw new Error(`NapCat API Error: ${res.status} ${res.statusText}${body ? ` | body=${body}` : ""}`);
+        throw new Error(`NapCat API Error: ${res.status} ${res.statusText}`);
     }
     return await res.json();
 }
 
-async function uploadGroupFileToNapCat(url: string, payload: {
-    groupId: string;
-    filePath: string;
-    fileName: string;
-    folder?: string;
-}, token?: string) {
-    // NapCat upload_group_file expects JSON payload (go-cqhttp style), not multipart form-data.
-    const requestPayload: Record<string, unknown> = {
-        group_id: payload.groupId,
-        file: payload.filePath,
-        name: payload.fileName,
-        upload_file: true,
-    };
-    if (payload.folder) {
-        requestPayload.folder = payload.folder;
+function buildMediaProxyUrl(mediaUrl: string, config: any): string {
+    const enabled = config.mediaProxyEnabled === true;
+    const baseUrl = String(config.publicBaseUrl || "").trim().replace(/\/+$/, "");
+    if (!enabled || !baseUrl) return mediaUrl;
+
+    const token = String(config.mediaProxyToken || "").trim();
+    const query = new URLSearchParams({ url: mediaUrl });
+    if (token) query.set("token", token);
+    return `${baseUrl}/napcat/media?${query.toString()}`;
+}
+
+function isAudioMedia(mediaUrl: string): boolean {
+    return /\.(wav|mp3|amr|silk|ogg|m4a|flac|aac)(?:\?.*)?$/i.test(mediaUrl);
+}
+
+function resolveVoiceMediaUrl(mediaUrl: string, config: any): string {
+    const trimmed = mediaUrl.trim();
+    if (!trimmed) return trimmed;
+    if (/^(https?:\/\/|file:\/\/)/i.test(trimmed) || trimmed.startsWith("/")) {
+        return trimmed;
     }
-    return await sendToNapCat(url, requestPayload, token);
+    const voiceBasePath = String(config.voiceBasePath || "").trim().replace(/\/+$/, "");
+    if (!voiceBasePath) return trimmed;
+    return `${voiceBasePath}/${trimmed.replace(/^\/+/, "")}`;
 }
 
-async function ensureReadableFile(filePath: string): Promise<void> {
-    await access(filePath);
-}
-
-function getContainerVisiblePath(localPath: string, config: any): string | null {
-    const hostPrefix = String(config.groupFileHostPrefix || "").trim().replace(/\/+$/, "");
-    const containerPrefix = String(config.groupFileContainerPrefix || "").trim().replace(/\/+$/, "");
-    if (!hostPrefix || !containerPrefix) return null;
-    if (!localPath.startsWith(hostPrefix + "/") && localPath !== hostPrefix) return null;
-    const relative = localPath.slice(hostPrefix.length).replace(/^\/+/, "");
-    return `${containerPrefix}/${relative}`;
-}
-
-async function stageFileForNapCat(localPath: string, config: any): Promise<string | null> {
-    const hostStageDir = String(config.groupFileStageHostDir || "").trim();
-    const containerStageDir = String(config.groupFileStageContainerDir || "").trim();
-    if (!hostStageDir || !containerStageDir) return null;
-
-    const fileName = path.basename(localPath);
-    const stagedHostPath = path.join(hostStageDir, fileName);
-    await mkdir(hostStageDir, { recursive: true });
-    await copyFile(localPath, stagedHostPath);
-    return `${containerStageDir.replace(/\/+$/, "")}/${fileName}`;
-}
-
-function isNapCatGroupFileCandidate(mediaUrl: string): boolean {
-    if (!mediaUrl) return false;
-    if (/^https?:\/\//i.test(mediaUrl)) return false;
-    const lower = mediaUrl.toLowerCase();
-    if (isAudioMedia(lower)) return false;
-    if (/\.(png|jpe?g|gif|webp|bmp|svg)(?:\?.*)?$/i.test(lower)) return false;
-    return true;
+function buildNapCatMediaCq(mediaUrl: string, config: any): string {
+    const resolvedUrl = isAudioMedia(mediaUrl) ? resolveVoiceMediaUrl(mediaUrl, config) : mediaUrl;
+    const proxiedMediaUrl = buildMediaProxyUrl(resolvedUrl, config);
+    const type = isAudioMedia(resolvedUrl) ? "record" : "image";
+    return `[CQ:${type},file=${proxiedMediaUrl}]`;
 }
 
 function normalizeNapCatTarget(raw: string): string {
@@ -179,36 +145,6 @@ export const napcatPlugin = {
                 description: "Base directory for relative audio files (e.g. /tmp/napcat-voice)",
                 default: ""
             },
-            groupFileFolder: {
-                type: "string",
-                title: "Group File Default Folder",
-                description: "Optional NapCat group file folder path used by /upload_group_file",
-                default: ""
-            },
-            groupFileHostPrefix: {
-                type: "string",
-                title: "Group File Host Prefix",
-                description: "Host path prefix that is mounted into NapCat container (e.g. /Users/me/shared)",
-                default: ""
-            },
-            groupFileContainerPrefix: {
-                type: "string",
-                title: "Group File Container Prefix",
-                description: "Container path prefix matching host prefix (e.g. /app/shared)",
-                default: ""
-            },
-            groupFileStageHostDir: {
-                type: "string",
-                title: "Group File Stage Host Dir",
-                description: "Host directory (mounted into NapCat container) to stage files before upload",
-                default: ""
-            },
-            groupFileStageContainerDir: {
-                type: "string",
-                title: "Group File Stage Container Dir",
-                description: "Container directory corresponding to stage host dir (e.g. /app/napcat/plugins/upload-staging)",
-                default: ""
-            },
             enableInboundLogging: {
                 type: "boolean",
                 title: "Enable Inbound Message Logging",
@@ -220,12 +156,6 @@ export const napcatPlugin = {
                 title: "Inbound Log Directory",
                 description: "Directory to store per-user/per-group inbound logs",
                 default: "./logs/napcat-inbound"
-            },
-            token: {
-                type: "string",
-                title: "HTTP API Token",
-                description: "Token for authenticating with NapCat HTTP server (Bearer token)",
-                default: ""
             }
         }
     },
@@ -249,7 +179,6 @@ export const napcatPlugin = {
         sendText: async ({ to, text, cfg }: any) => {
             const config = cfg.channels?.napcat || {};
             const baseUrl = config.url || "http://127.0.0.1:3000";
-            const token = String(config.token || "").trim();
             
             let targetType = "private";
             let targetId = to;
@@ -282,7 +211,7 @@ export const napcatPlugin = {
             console.log(`[NapCat] Sending to ${targetType} ${targetId}: ${text}`);
             
             try {
-                const result = await sendToNapCat(`${baseUrl}${endpoint}`, payload, token);
+                const result = await sendToNapCat(`${baseUrl}${endpoint}`, payload);
                 return { ok: true, result };
             } catch (err: any) {
                 return { ok: false, error: err.message };
@@ -291,7 +220,6 @@ export const napcatPlugin = {
         sendMedia: async ({ to, text, mediaUrl, cfg }: any) => {
             const config = cfg.channels?.napcat || {};
             const baseUrl = config.url || "http://127.0.0.1:3000";
-            const token = String(config.token || "").trim();
 
             let targetType = "private";
             let targetId = to;
@@ -312,77 +240,9 @@ export const napcatPlugin = {
 
             const endpoint = targetType === "group" ? "/send_group_msg" : "/send_private_msg";
 
-            const isGroupFile =
-                targetType === "group" &&
-                !!mediaUrl &&
-                isNapCatGroupFileCandidate(mediaUrl);
-
-            if (isGroupFile) {
-                let stagedPath: string | null = null;
-                try {
-                    const localFilePath = resolveLocalFilePath(mediaUrl!);
-                    if (!localFilePath) {
-                        throw new Error("Group file upload requires a local path or file:// URL");
-                    }
-                    await ensureReadableFile(localFilePath);
-                    const fileName = path.basename(localFilePath);
-                    const folder = String(config.groupFileFolder || "").trim();
-
-                    const mappedPath = getContainerVisiblePath(localFilePath, config);
-                    stagedPath = mappedPath ? null : await stageFileForNapCat(localFilePath, config);
-                    const uploadFilePath = mappedPath || stagedPath || localFilePath;
-
-                    if (uploadFilePath === localFilePath && !mappedPath && !stagedPath) {
-                        throw new Error("Group file path is not container-visible. Configure groupFileHostPrefix/groupFileContainerPrefix or groupFileStageHostDir/groupFileStageContainerDir.");
-                    }
-
-                    const uploadPayload = {
-                        groupId: targetId,
-                        filePath: uploadFilePath,
-                        fileName,
-                        folder: folder || undefined,
-                    };
-                    console.log(`[NapCat] upload_group_file local=${localFilePath} uploadFilePath=${uploadFilePath} payload=${JSON.stringify({
-                        group_id: uploadPayload.groupId,
-                        file: uploadPayload.filePath,
-                        name: uploadPayload.fileName,
-                        folder: uploadPayload.folder ?? null,
-                        upload_file: true,
-                    })}`);
-                    const uploadResult = await uploadGroupFileToNapCat(`${baseUrl}/upload_group_file`, uploadPayload, token);
-
-                    if (text && text.trim()) {
-                        await sendToNapCat(`${baseUrl}${endpoint}`, {
-                            group_id: targetId,
-                            message: text,
-                        }, token);
-                    }
-
-                    console.log(`[NapCat] Uploaded group file to ${targetId}: ${localFilePath}`);
-                    return { ok: true, result: uploadResult };
-                } catch (err: any) {
-                    return { ok: false, error: err.message };
-                } finally {
-                    if (stagedPath) {
-                        try {
-                            const hostStageDir = String(config.groupFileStageHostDir || "").trim().replace(/\/+$/, "");
-                            const containerStageDir = String(config.groupFileStageContainerDir || "").trim().replace(/\/+$/, "");
-                            if (hostStageDir && containerStageDir && stagedPath.startsWith(`${containerStageDir}/`)) {
-                                const relative = stagedPath.slice(containerStageDir.length).replace(/^\/+/, "");
-                                const stagedHostPath = path.join(hostStageDir, relative);
-                                await unlink(stagedHostPath);
-                                console.log(`[NapCat] Cleaned staged file: ${stagedHostPath}`);
-                            }
-                        } catch (cleanupErr: any) {
-                            console.warn(`[NapCat] Failed to cleanup staged file ${stagedPath}: ${cleanupErr?.message || cleanupErr}`);
-                        }
-                    }
-                }
-            }
-
-            // Basic media support: try CQ image/record format.
+            // Basic media support: try CQ image format, fallback to plain URL.
             const mediaMessage = mediaUrl
-                ? await buildNapCatMediaCq(mediaUrl, config)
+                ? buildNapCatMediaCq(mediaUrl, config)
                 : "";
             const message = text
                 ? (mediaMessage ? `${text}\n${mediaMessage}` : text)
@@ -395,7 +255,7 @@ export const napcatPlugin = {
             console.log(`[NapCat] Sending media to ${targetType} ${targetId}: ${message}`);
 
             try {
-                const result = await sendToNapCat(`${baseUrl}${endpoint}`, payload, token);
+                const result = await sendToNapCat(`${baseUrl}${endpoint}`, payload);
                 return { ok: true, result };
             } catch (err: any) {
                 return { ok: false, error: err.message };
